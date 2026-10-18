@@ -112,10 +112,29 @@ while IFS= read -r line; do
 
   if [ "$remote_ref" != "refs/heads/main" ] && [ "$auto_release_ok" -eq 1 ] \
       && [ -f "$ROOT/scripts/release-auto.sh" ]; then
-    if ! bash "$ROOT/scripts/release-auto.sh" </dev/null; then
+    # Failure is NON-BLOCKING by default. Releasing is a follow-up to the push,
+    # not a precondition for it -- and the host running this hook frequently
+    # cannot build at all (no musl/mingw cross toolchain, a 4 GiB cgroup, or a
+    # machine where the release binaries come from CI anyway). Fail-closed here
+    # wedged every `git push origin dev` behind a local cross-build that was
+    # never going to succeed, which defeats the purpose of a tag producer that
+    # is supposed to be independent of the developer's machine.
+    # RUSTCODE_AUTO_RELEASE_STRICT=1 restores blocking behaviour for hosts that
+    # DO build (a release machine, or CI). The artifact gate below still verifies
+    # whatever actually got committed, so a skipped release cannot masquerade as
+    # a good one.
+    if bash "$ROOT/scripts/release-auto.sh" </dev/null; then
+      :
+    else
+      rc=$?
       echo "" >&2
-      echo "[ERROR] auto-release failed; aborting push. Fix the build, then push again." >&2
-      exit 1
+      echo "[WARN] auto-release failed (exit $rc); pushing WITHOUT a new release." >&2
+      echo "       Fix the build, then re-run it explicitly:" >&2
+      echo "         bash scripts/release-auto.sh" >&2
+      echo "       (RUSTCODE_AUTO_RELEASE_STRICT=1 makes this failure blocking again.)" >&2
+      if [ "${RUSTCODE_AUTO_RELEASE_STRICT:-0}" = "1" ]; then
+        exit "$rc"
+      fi
     fi
   fi
 

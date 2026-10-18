@@ -10,6 +10,41 @@ trap 'jobs -p | xargs kill 2>/dev/null || true' EXIT
 
 REPORT="test-report.md"
 
+# ---- resource guards (OOM is the failure mode, not slowness) ----------------
+# Peak memory in a workspace test run comes from LINKING the four big binaries,
+# not from compiling the small crates. Two independent knobs, both overridable:
+#
+#   RUSTCODE_TEST_JOBS     parallel cargo jobs (default: min(nproc, 2)).
+#                          Small machines (4 GiB cgroup) want 1; CI runners have
+#                          the headroom but still benefit from 2.
+#   RUSTCODE_TEST_SYMBOLS=1  keep debug info on the big binaries. Off by default
+#                          because `debug = 0` shrinks the linker's working set
+#                          several-fold; library crates keep their symbols either
+#                          way, so a backtrace in rustcode-config still resolves.
+#   RUSTCODE_TEST_INCREMENTAL=1  re-enable incremental compilation. Off by default:
+#                          target/debug/incremental is the directory that grows
+#                          past 15 GB and makes the linker fail with
+#                          "No space left on device" (see AGENTS.md).
+JOBS="${RUSTCODE_TEST_JOBS:-}"
+if [ -z "$JOBS" ]; then
+  NPROC="$(nproc 2>/dev/null || echo 2)"
+  if [ "$NPROC" -gt 2 ]; then NPROC=2; fi
+  JOBS="$NPROC"
+fi
+
+BUILD_ENV=()
+if [ "${RUSTCODE_TEST_SYMBOLS:-0}" != "1" ]; then
+  BUILD_ENV+=(
+    "CARGO_PROFILE_DEV_PACKAGE_rustcode_DEBUG=0"
+    "CARGO_PROFILE_DEV_PACKAGE_rustcode_daemon_DEBUG=0"
+    "CARGO_PROFILE_DEV_PACKAGE_rustcode_coding_DEBUG=0"
+    "CARGO_PROFILE_DEV_PACKAGE_rustcode_tuix_DEBUG=0"
+  )
+fi
+if [ "${RUSTCODE_TEST_INCREMENTAL:-0}" != "1" ]; then
+  BUILD_ENV+=("CARGO_INCREMENTAL=0")
+fi
+
 echo "# RustCode Test Report" > $REPORT
 echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')" >> $REPORT
 echo "**Build:** $(git rev-parse --short HEAD)" >> $REPORT
@@ -25,7 +60,7 @@ echo "=== RustCode Full Test Suite ==="
 echo ""
 echo -n "Compiling & running all tests... "
 set +e
-output=$(cargo test --workspace 2>&1)
+output=$(env "${BUILD_ENV[@]}" cargo test --workspace -j "$JOBS" 2>&1)
 cargo_status=$?
 set -e
 

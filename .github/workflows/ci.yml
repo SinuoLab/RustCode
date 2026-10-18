@@ -136,7 +136,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: run workspace tests (allowlist-guarded)
+      # Peak memory during a workspace test build is dominated by LINKING the
+      # big binaries (rustcode / rustcode-daemon / rustcode-coding / rustcode-tuix),
+      # not by compiling the small crates. Dropping debug info for those four
+      # cuts the linker's working set (and the artifact size) several-fold while
+      # keeping full debug symbols for every library crate -- a panic backtrace
+      # in rustcode-config still resolves to a line. CARGO_PROFILE_* env vars
+      # keep this out of Cargo.toml, so no source change is needed to toggle it.
+      - name: run workspace tests (allowlist-guarded, debug symbols off for the big bins)
+        env:
+          CARGO_PROFILE_DEV_PACKAGE_rustcode_DEBUG: 0
+          CARGO_PROFILE_DEV_PACKAGE_rustcode_daemon_DEBUG: 0
+          CARGO_PROFILE_DEV_PACKAGE_rustcode_coding_DEBUG: 0
+          CARGO_PROFILE_DEV_PACKAGE_rustcode_tuix_DEBUG: 0
         run: |
           set +e
           cargo test --workspace --no-fail-fast > /tmp/cargo-test.log 2>&1
