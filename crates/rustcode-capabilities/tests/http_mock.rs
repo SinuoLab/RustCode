@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use rustcode_capabilities::hooks::WireLogHooks;
-use rustcode_capabilities::provider::{OpenAiCompatConfig, OpenAiCompatProvider, RetryPolicy};
+use rustcode_capabilities::provider::{
+    OpenAiCompatConfig, OpenAiCompatProvider, ReasoningPolicy, RetryPolicy,
+};
 use rustcode_kernel::agent::{Agent, AutoRespond};
 use rustcode_kernel::event::{AgentCommand, AgentEvent};
 use rustcode_kernel::message::Message;
@@ -50,6 +52,23 @@ fn provider_for(server_uri: &str, model: &str) -> OpenAiCompatProvider {
         base_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(5),
     };
+    OpenAiCompatProvider::new(cfg).expect("build provider")
+}
+
+/// Like [`provider_for`] but with an EXPLICIT reasoning round-trip policy (the
+/// `reasoning_history` config override), bypassing the per-model derive.
+fn provider_for_with_policy(
+    server_uri: &str,
+    model: &str,
+    policy: ReasoningPolicy,
+) -> OpenAiCompatProvider {
+    let mut cfg = OpenAiCompatConfig::new("test-key", server_uri, model);
+    cfg.retry = RetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    cfg.reasoning_policy = Some(policy);
     OpenAiCompatProvider::new(cfg).expect("build provider")
 }
 
@@ -399,6 +418,16 @@ async fn multi_round_tool_loop_executes_tool_and_logs_each_round() {
 /// answer. Returns the requests the server received (so a test can inspect round 2's
 /// body). Asserts the loop completed cleanly with the final answer.
 async fn run_two_round(model: &str, round1_sse: &str) -> Vec<wiremock::Request> {
+    run_two_round_with_policy(model, round1_sse, None).await
+}
+
+/// [`run_two_round`] with an EXPLICIT reasoning policy (bypasses the per-model
+/// derive; `None` = derive, as [`run_two_round`] does).
+async fn run_two_round_with_policy(
+    model: &str,
+    round1_sse: &str,
+    policy: Option<ReasoningPolicy>,
+) -> Vec<wiremock::Request> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
@@ -412,7 +441,10 @@ async fn run_two_round(model: &str, round1_sse: &str) -> Vec<wiremock::Request> 
         .mount(&server)
         .await;
 
-    let provider = Arc::new(provider_for(&server.uri(), model));
+    let provider = Arc::new(match policy {
+        Some(p) => provider_for_with_policy(&server.uri(), model, p),
+        None => provider_for(&server.uri(), model),
+    });
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(GetTimeTool));
     let tools = registry.mount(&["get_time"]);
@@ -550,6 +582,46 @@ async fn multi_round_reasoning_is_stripped_for_deepseek_r1() {
     assert!(
         !round2.contains("reasoning_content"),
         "R1 (Exclude) must NOT echo reasoning_content (400 otherwise): {round2}"
+    );
+    // sanity: the round still carried the tool result + the assistant tool_call.
+    assert!(round2.contains("12:00"), "tool result still fed back");
+    assert!(
+        round2.contains("get_time"),
+        "assistant tool_call still echoed"
+    );
+}
+
+/// Round-1 SSE from a `reasoning`-NAMED thinking model: same shape as
+/// [`ROUND1_REASONING_TOOL_SSE`] but the reasoning deltas ride the SHORTER
+/// `reasoning` field (certain Qwen / vLLM / gateway builds).
+const ROUND1_REASONING_FIELD_TOOL_SSE: &str = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me think. \"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"I should call get_time.\"}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+data: [DONE]\n";
+
+/// Preserve end-to-end over the real HTTP loop: a provider that STREAMED reasoning on
+/// the `reasoning` field echoes it back on THAT field in round 2 -- never on
+/// `reasoning_content`. Proves the heard-field cell crosses the stream -> next-request
+/// boundary (the part the module-level tests can only pin at unit level).
+#[tokio::test]
+async fn multi_round_preserve_echoes_on_the_heard_field() {
+    let reqs = run_two_round_with_policy(
+        "qwen-reasoning-named",
+        ROUND1_REASONING_FIELD_TOOL_SSE,
+        Some(ReasoningPolicy::Preserve),
+    )
+    .await;
+    assert_eq!(reqs.len(), 2, "two rounds");
+
+    let round2 = String::from_utf8_lossy(&reqs[1].body);
+    assert!(
+        round2.contains("\"reasoning\":\"Let me think. I should call get_time.\""),
+        "Preserve must echo the EXACT round-1 reasoning on `reasoning`: {round2}"
+    );
+    assert!(
+        !round2.contains("reasoning_content"),
+        "Preserve must echo on the heard field ONLY, not reasoning_content: {round2}"
     );
     // sanity: the round still carried the tool result + the assistant tool_call.
     assert!(round2.contains("12:00"), "tool result still fed back");

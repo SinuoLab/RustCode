@@ -31,6 +31,87 @@
 /// non-empty requirement without giving the model prose to echo (ported from core 54c9e4bb).
 pub const REASONING_PLACEHOLDER: &str = ".";
 
+/// The wire FIELD NAME a provider uses to carry its reasoning / chain-of-thought.
+///
+/// Upstream OpenAI-compatible vendors disagree on the spelling: most (DeepSeek-V4,
+/// GLM, ...) stream `reasoning_content`, but some (certain Qwen / vLLM / gateway
+/// builds) use the shorter `reasoning`. Under [`ReasoningPolicy::Preserve`] the
+/// adapter echoes the prior turn's reasoning back on the SAME field it streamed on,
+/// so both namings round-trip without a hard-coded guess. Everywhere else the field
+/// is fixed to [`ReasoningField::ReasoningContent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReasoningField {
+    /// `reasoning_content` -- the common OpenAI-compatible field (the default).
+    #[default]
+    ReasoningContent,
+    /// `reasoning` -- the shorter spelling some upstreams stream.
+    Reasoning,
+}
+
+impl ReasoningField {
+    /// The exact JSON key this field serialises to on the wire.
+    pub fn key(&self) -> &'static str {
+        match self {
+            ReasoningField::ReasoningContent => "reasoning_content",
+            ReasoningField::Reasoning => "reasoning",
+        }
+    }
+
+    /// Dense encoding for the lock-free [`HeardReasoningField`] cell.
+    const fn as_u8(self) -> u8 {
+        match self {
+            ReasoningField::ReasoningContent => 0,
+            ReasoningField::Reasoning => 1,
+        }
+    }
+
+    /// Inverse of [`ReasoningField::as_u8`]; anything unexpected decodes to the
+    /// default `reasoning_content` so a corrupt cell can only ever pick the safe
+    /// field, never an invalid one.
+    fn from_u8(v: u8) -> ReasoningField {
+        match v {
+            1 => ReasoningField::Reasoning,
+            _ => ReasoningField::ReasoningContent,
+        }
+    }
+}
+
+/// A cloneable, lock-free cell that REMEMBERS which reasoning field name a provider
+/// streamed on this session, so the NEXT request can echo reasoning back on the same
+/// field under [`ReasoningPolicy::Preserve`].
+///
+/// `Arc`-shared: the streaming decoder records the field as deltas arrive, and
+/// [`build_request`](super::openai_compat) reads it back on the next turn -- both hold
+/// one clone of the SAME cell, so a turn that streamed `reasoning` keeps echoing
+/// `reasoning` for the rest of the session. Relaxed ordering suffices: this is a
+/// single-word hint that only needs to become visible, never a synchronisation point.
+/// `Default` = [`ReasoningField::ReasoningContent`] so a provider that never streams
+/// reasoning still echoes the common field.
+#[derive(Clone, Default)]
+pub struct HeardReasoningField(std::sync::Arc<HeardReasoningFieldInner>);
+
+#[derive(Default)]
+struct HeardReasoningFieldInner {
+    // 0 == ReasoningContent (AtomicU8's Default), 1 == Reasoning; see
+    // ReasoningField::{as_u8, from_u8}. The Default-on-zero invariant is what makes
+    // HeardReasoningField::default() decode to ReasoningContent.
+    field: std::sync::atomic::AtomicU8,
+}
+
+impl HeardReasoningField {
+    /// The field name last heard (Relaxed load). Defaults to `reasoning_content`.
+    pub fn get(&self) -> ReasoningField {
+        ReasoningField::from_u8(self.0.field.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Record the field name heard on the wire (Relaxed store).
+    pub fn set(&self, field: ReasoningField) {
+        self.0
+            .field
+            .store(field.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Whether a model echoes prior-turn `reasoning_content` back on the next request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningPolicy {
@@ -38,14 +119,19 @@ pub enum ReasoningPolicy {
     Include,
     /// Never echo `reasoning_content`.
     Exclude,
+    /// Echo on WHICHEVER field the provider streamed reasoning on this session
+    /// (`reasoning_content` or `reasoning`, see [`HeardReasoningField`]); the usual
+    /// `REASONING_PLACEHOLDER` applies when no reasoning was captured. Byte-identical
+    /// to [`ReasoningPolicy::Include`] for a `reasoning_content`-streaming provider.
+    Preserve,
 }
 
 impl ReasoningPolicy {
     /// Parse the user-facing `reasoning_history` config value into an explicit
     /// override. `None`/empty ⇒ `Ok(None)` (caller falls back to [`derive`]);
-    /// `"include"`/`"exclude"` (case/space-insensitive) ⇒ the matching policy; any
-    /// other value is a typo and fails fast -- mirrors `rustcode-core`'s load-time
-    /// validation so a bad config errors the same way on either engine.
+    /// `"include"`/`"exclude"`/`"preserve"` (case/space-insensitive) ⇒ the matching
+    /// policy; any other value is a typo and fails fast -- mirrors `rustcode-core`'s
+    /// load-time validation so a bad config errors the same way on either engine.
     ///
     /// [`derive`]: ReasoningPolicy::derive
     pub fn from_config(value: Option<&str>) -> Result<Option<Self>, String> {
@@ -54,9 +140,10 @@ impl ReasoningPolicy {
             Some(s) if s.is_empty() => Ok(None),
             Some(s) if s == "include" => Ok(Some(ReasoningPolicy::Include)),
             Some(s) if s == "exclude" => Ok(Some(ReasoningPolicy::Exclude)),
+            Some(s) if s == "preserve" => Ok(Some(ReasoningPolicy::Preserve)),
             Some(other) => Err(format!(
-                "invalid `reasoning_history` value {other:?} -- expected \"include\" or \
-                 \"exclude\" (unset = auto-detect)"
+                "invalid `reasoning_history` value {other:?} -- expected \"include\", \
+                 \"exclude\", or \"preserve\" (unset = auto-detect)"
             )),
         }
     }
@@ -164,7 +251,38 @@ mod tests {
             ReasoningPolicy::from_config(Some(" Exclude ")),
             Ok(Some(ReasoningPolicy::Exclude))
         );
+        assert_eq!(
+            ReasoningPolicy::from_config(Some("Preserve")),
+            Ok(Some(ReasoningPolicy::Preserve))
+        );
         assert!(ReasoningPolicy::from_config(Some("sometimes")).is_err());
+    }
+
+    #[test]
+    fn reasoning_field_key_maps_to_wire_spelling() {
+        assert_eq!(ReasoningField::ReasoningContent.key(), "reasoning_content");
+        assert_eq!(ReasoningField::Reasoning.key(), "reasoning");
+    }
+
+    #[test]
+    fn heard_reasoning_field_defaults_to_reasoning_content() {
+        // The Default-on-zero invariant: a provider that never streams reasoning
+        // must still echo the common `reasoning_content` field under Preserve.
+        let heard = HeardReasoningField::default();
+        assert_eq!(heard.get(), ReasoningField::ReasoningContent);
+    }
+
+    #[test]
+    fn heard_reasoning_field_set_get_roundtrips() {
+        let heard = HeardReasoningField::default();
+        heard.set(ReasoningField::Reasoning);
+        assert_eq!(heard.get(), ReasoningField::Reasoning);
+        heard.set(ReasoningField::ReasoningContent);
+        assert_eq!(heard.get(), ReasoningField::ReasoningContent);
+        // Clone is an Arc clone: both handles observe the SAME cell.
+        let clone = heard.clone();
+        heard.set(ReasoningField::Reasoning);
+        assert_eq!(clone.get(), ReasoningField::Reasoning);
     }
 
     #[test]

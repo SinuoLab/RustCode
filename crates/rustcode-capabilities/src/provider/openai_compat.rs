@@ -13,9 +13,13 @@
 //!     `preserve_order`), with no timestamps/uuids, so the same `(messages, tools)`
 //!     always serialize identically.
 //!   - `reasoning_content` round-trip is policy-driven ([`ReasoningPolicy`]); the
-//!     kernel stores reasoning, this adapter decides Include/Exclude.
+//!     kernel stores reasoning, this adapter decides Include/Exclude/Preserve --
+//!     Preserve keeps the field NAME the upstream streamed on (see
+//!     [`HeardReasoningField`]).
 
-use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
+use super::reasoning::{
+    HeardReasoningField, ReasoningField, ReasoningPolicy, REASONING_PLACEHOLDER,
+};
 use super::retry::{self, RetryPolicy};
 use super::sign::{RequestSigner, RequestSigningError};
 use async_trait::async_trait;
@@ -318,6 +322,13 @@ pub struct OpenAiCompatProvider {
     /// re-trigger the same 400. Session-scoped: a `/session` switch rebuilds the
     /// provider and resets this.
     effort_unsupported: std::sync::atomic::AtomicBool,
+    /// Which reasoning field name this session's provider streamed on, recorded by the
+    /// SSE decoder as deltas arrive and read back on the NEXT request under
+    /// [`ReasoningPolicy::Preserve`] so reasoning is echoed on the same field
+    /// (`reasoning_content` vs `reasoning`). `Arc`-shared with the per-stream decoder;
+    /// session-scoped (a `/session` switch rebuilds the provider and resets it to the
+    /// default `reasoning_content`).
+    reasoning_field: std::sync::Arc<HeardReasoningField>,
 }
 
 impl OpenAiCompatProvider {
@@ -349,6 +360,7 @@ impl OpenAiCompatProvider {
             url,
             session_id: std::sync::OnceLock::new(),
             effort_unsupported: std::sync::atomic::AtomicBool::new(false),
+            reasoning_field: std::sync::Arc::new(HeardReasoningField::default()),
         })
     }
 
@@ -381,6 +393,7 @@ impl OpenAiCompatProvider {
                 &stripped,
                 &self.cfg,
                 self.policy,
+                self.reasoning_field.get(),
             );
             return (body, stripped.rate_limit_retry_owner);
         }
@@ -391,6 +404,7 @@ impl OpenAiCompatProvider {
             options,
             &self.cfg,
             self.policy,
+            self.reasoning_field.get(),
         );
         (body, options.rate_limit_retry_owner)
     }
@@ -670,6 +684,9 @@ impl LlmProvider for OpenAiCompatProvider {
         let idle = self.cfg.idle_timeout;
         let open_timeout = self.cfg.open_timeout;
         let extra_headers = self.cfg.extra_headers.clone();
+        // Shared with the per-stream decoder so the field name it records as deltas
+        // arrive is the SAME cell `build_request` reads on the next turn (Preserve).
+        let reasoning_field = self.reasoning_field.clone();
         let effort_known_unsupported = self
             .effort_unsupported
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -717,7 +734,7 @@ impl LlmProvider for OpenAiCompatProvider {
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
             'reopen: loop {
-                let mut dec = SseDecoder::new();
+                let mut dec = SseDecoder::new().hearing(reasoning_field.clone());
                 let mut emitted_replay_sensitive = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
@@ -1267,6 +1284,7 @@ fn format_messages(
     messages: &[Message],
     policy: ReasoningPolicy,
     supports_vision: bool,
+    heard: ReasoningField,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     // Strict OpenAI-compatible chat templates (including Qwen/vLLM) require
@@ -1365,13 +1383,24 @@ fn format_messages(
                         .collect();
                     obj.insert("tool_calls".into(), json!(tcs));
                 }
-                if policy == ReasoningPolicy::Include {
+                // Which wire field (if any) carries this turn's reasoning back:
+                //   Exclude  -> nothing (R1/reasoner 400s if `reasoning_content` is sent);
+                //   Include  -> always `reasoning_content` (+ placeholder if none), the
+                //               field DeepSeek-V4 REQUIRES -- byte-identical to before;
+                //   Preserve -> the field the provider STREAMED on this session (`heard`),
+                //               so a `reasoning`-naming upstream round-trips too.
+                let echo_field = match policy {
+                    ReasoningPolicy::Exclude => None,
+                    ReasoningPolicy::Include => Some(ReasoningField::ReasoningContent),
+                    ReasoningPolicy::Preserve => Some(heard),
+                };
+                if let Some(field) = echo_field {
                     let echo = m
                         .reasoning
                         .as_deref()
                         .filter(|s| !s.is_empty())
                         .unwrap_or(REASONING_PLACEHOLDER);
-                    obj.insert("reasoning_content".into(), json!(echo));
+                    obj.insert(field.key().into(), json!(echo));
                 }
                 out.push(Value::Object(obj));
             }
@@ -1400,12 +1429,18 @@ fn build_request_body(
     options: &ChatOptions,
     cfg: &OpenAiCompatConfig,
     policy: ReasoningPolicy,
+    heard: ReasoningField,
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert(
         "messages".into(),
-        json!(format_messages(messages, policy, cfg.supports_vision)),
+        json!(format_messages(
+            messages,
+            policy,
+            cfg.supports_vision,
+            heard
+        )),
     );
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -1743,6 +1778,10 @@ struct SseDecoder {
     response_model_seen: bool,
     seen_finish: bool,
     tool_call_delta_count: usize,
+    /// Records which reasoning field name this stream actually saw, so the provider's
+    /// next turn can echo reasoning on the same field (Preserve). Injected via
+    /// [`SseDecoder::hearing`]; defaults to an isolated cell under [`SseDecoder::new`].
+    reasoning_field: std::sync::Arc<HeardReasoningField>,
 }
 
 impl SseDecoder {
@@ -1757,7 +1796,17 @@ impl SseDecoder {
             response_model_seen: false,
             seen_finish: false,
             tool_call_delta_count: 0,
+            reasoning_field: std::sync::Arc::new(HeardReasoningField::default()),
         }
+    }
+
+    /// Point this decoder at a SHARED [`HeardReasoningField`] cell (the provider's), so
+    /// the field name it records is visible to the provider's next request. Kept as a
+    /// builder (not a `new` parameter) so the ~20 `SseDecoder::new()` unit-test sites
+    /// stay untouched -- they get an isolated default cell and never call this.
+    fn hearing(mut self, reasoning_field: std::sync::Arc<HeardReasoningField>) -> Self {
+        self.reasoning_field = reasoning_field;
+        self
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
@@ -1873,8 +1922,20 @@ impl SseDecoder {
                 out.push(StreamEvent::TextDelta(c));
             }
         }
+        // Reasoning deltas arrive on EITHER field; record which one so Preserve can
+        // echo back on the same field next turn. Semantics: within one delta
+        // `reasoning_content` wins and a same-delta `reasoning` is dropped (a provider
+        // mixing both spellings in one delta is a malformed upstream); ACROSS deltas
+        // the cell is last-write-wins, i.e. an upstream that renames mid-stream makes
+        // the echo follow the LAST field seen.
         if let Some(r) = choice.delta.reasoning_content {
             if !r.is_empty() {
+                self.reasoning_field.set(ReasoningField::ReasoningContent);
+                out.push(StreamEvent::Reasoning(r));
+            }
+        } else if let Some(r) = choice.delta.reasoning {
+            if !r.is_empty() {
+                self.reasoning_field.set(ReasoningField::Reasoning);
                 out.push(StreamEvent::Reasoning(r));
             }
         }
@@ -2007,6 +2068,8 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -2380,7 +2443,12 @@ mod tests {
             Message::assistant("ans", vec![]),
             Message::tool_result("call_1", "result text", false),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[2]["role"], "assistant");
@@ -2404,7 +2472,12 @@ mod tests {
             Message::system("MEMORY\n- fact"),
             Message::user("hi"),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let systems = out.iter().filter(|v| v["role"] == "system").count();
         assert_eq!(
             systems, 1,
@@ -2428,7 +2501,12 @@ mod tests {
             Message::user("continue"),
         ];
 
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
 
         assert_eq!(
             out[0],
@@ -2444,7 +2522,12 @@ mod tests {
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path -> a no-image conversation's prefix
         // cache is unperturbed.
-        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[Message::user("hi")],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
     }
 
@@ -2458,7 +2541,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
@@ -2481,7 +2569,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, false);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            false,
+            ReasoningField::ReasoningContent,
+        );
         let c = &out[0]["content"];
         assert!(
             c.is_string(),
@@ -2518,7 +2611,12 @@ mod tests {
                 data: "eHl6".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -2537,7 +2635,12 @@ mod tests {
             }],
         );
         assert_eq!(
-            format_messages(&[m], ReasoningPolicy::Exclude, true)[0],
+            format_messages(
+                &[m],
+                ReasoningPolicy::Exclude,
+                true,
+                ReasoningField::ReasoningContent
+            )[0],
             json!({"role":"user","content":""})
         );
     }
@@ -2552,7 +2655,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert_eq!(
             out[0]["content"][1]["image_url"]["url"],
             "data:application/octet-stream;base64,QUJD"
@@ -2569,7 +2677,12 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let a = &out[0];
         assert_eq!(a["role"], "assistant");
         assert_eq!(a["content"], ""); // present even when empty
@@ -2599,7 +2712,12 @@ mod tests {
                         .into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let args = out[0]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -2624,7 +2742,12 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert_eq!(
             out[0]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a\"}"
@@ -2643,7 +2766,12 @@ mod tests {
                 arguments: "not json at all <tool_result>".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         let args = out[0]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -2658,7 +2786,12 @@ mod tests {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
         let no = Message::assistant("ans2", vec![]);
-        let out = format_messages(&[with, no], ReasoningPolicy::Include, true);
+        let out = format_messages(
+            &[with, no],
+            ReasoningPolicy::Include,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert_eq!(out[0]["reasoning_content"], "because");
         assert_eq!(out[1]["reasoning_content"], REASONING_PLACEHOLDER);
     }
@@ -2667,8 +2800,186 @@ mod tests {
     fn reasoning_exclude_never_echoes() {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
-        let out = format_messages(&[with], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[with],
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         assert!(out[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_preserve_echoes_on_the_heard_field() {
+        // Preserve mirrors the field the provider STREAMED reasoning on:
+        //   heard `reasoning`         -> echo under `reasoning`, NOT `reasoning_content`;
+        //   heard `reasoning_content` -> byte-identical to Include;
+        //   nothing heard (no reasoning) -> placeholder on whichever field was heard.
+        let mut with = Message::assistant("ans", vec![]);
+        with.reasoning = Some("because".into());
+        let no = Message::assistant("ans2", vec![]);
+
+        let r_field = format_messages(
+            &[with.clone(), no.clone()],
+            ReasoningPolicy::Preserve,
+            true,
+            ReasoningField::Reasoning,
+        );
+        assert_eq!(r_field[0]["reasoning"], "because");
+        assert!(
+            r_field[0].get("reasoning_content").is_none(),
+            "Preserve must NOT also emit reasoning_content: {:?}",
+            r_field[0]
+        );
+        assert_eq!(r_field[1]["reasoning"], REASONING_PLACEHOLDER);
+
+        let rc_field = format_messages(
+            &[with],
+            ReasoningPolicy::Preserve,
+            true,
+            ReasoningField::ReasoningContent,
+        );
+        assert_eq!(rc_field[0]["reasoning_content"], "because");
+        assert!(rc_field[0].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn sse_records_the_reasoning_field_and_preserve_echoes_it_on_the_wire() {
+        // Module-level end-to-end proof of the Preserve round-trip: a stream that
+        // carries reasoning on the `reasoning` field is RECORDED by the decoder, and
+        // the NEXT request echoes it back on that SAME field -- never reasoning_content.
+        // (The full HTTP/Agent round-trip lives in tests/http_mock.rs; this pins the
+        // decode -> record -> echo mechanism without the network.)
+        use std::sync::Arc;
+        let heard = Arc::new(HeardReasoningField::default());
+
+        let mut dec = SseDecoder::new().hearing(heard.clone());
+        let mut ev = Vec::new();
+        ev.extend(
+            dec.feed(
+                line(json!({"choices":[{"delta":{"reasoning":"Let me think. "}}]})).as_bytes(),
+            ),
+        );
+        ev.extend(
+            dec.feed(
+                line(json!({"choices":[{"delta":{"reasoning":"Call get_time."}}]})).as_bytes(),
+            ),
+        );
+        ev.extend(dec.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"get_time","arguments":"{}"}}]}}]})).as_bytes()));
+        ev.extend(
+            dec.feed(
+                line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes(),
+            ),
+        );
+        ev.extend(dec.feed(b"data: [DONE]\n"));
+
+        // The reasoning deltas surfaced AND flipped the shared heard cell to `reasoning`.
+        assert!(
+            ev.iter().any(|e| matches!(e, StreamEvent::Reasoning(_))),
+            "reasoning deltas must still surface as Reasoning events"
+        );
+        assert_eq!(heard.get(), ReasoningField::Reasoning);
+
+        // The next turn's request echoes reasoning on `reasoning` (Preserve + heard).
+        let mut asst = Message::assistant(
+            "ans",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "get_time".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        asst.reasoning = Some("Let me think. Call get_time.".into());
+        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "reasoning-named-model");
+        let body = build_request_body(
+            "reasoning-named-model",
+            &[asst],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Preserve,
+            heard.get(),
+        );
+        let asst_wire = &body["messages"][0];
+        assert_eq!(asst_wire["reasoning"], "Let me think. Call get_time.");
+        assert!(
+            asst_wire.get("reasoning_content").is_none(),
+            "Preserve must echo on the heard field ONLY, not both: {asst_wire}"
+        );
+    }
+
+    #[test]
+    fn preserve_defaults_to_reasoning_content_for_the_common_field() {
+        // A `reasoning_content`-streaming provider is byte-identical to Include under
+        // Preserve: the heard cell stays at its default, so the echo key is unchanged.
+        use std::sync::Arc;
+        let heard = Arc::new(HeardReasoningField::default());
+        let mut dec = SseDecoder::new().hearing(heard.clone());
+        let _ = dec.feed(
+            line(json!({"choices":[{"delta":{"reasoning_content":"pondering"}}]})).as_bytes(),
+        );
+        let _ = dec.feed(b"data: [DONE]\n");
+        assert_eq!(heard.get(), ReasoningField::ReasoningContent);
+
+        let mut asst = Message::assistant("ans", vec![]);
+        asst.reasoning = Some("pondering".into());
+        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "deepseek-v4-flash");
+        let body = build_request_body(
+            "deepseek-v4-flash",
+            &[asst],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Preserve,
+            heard.get(),
+        );
+        assert_eq!(body["messages"][0]["reasoning_content"], "pondering");
+        assert!(body["messages"][0].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn derived_policy_default_is_unchanged_glm_excludes_deepseek_v4_includes() {
+        // Regression guard: adding Preserve must NOT perturb the derived default.
+        // GLM derives Exclude (nothing echoed); DeepSeek-V4 derives Include
+        // (reasoning_content) -- even when the heard field was once `reasoning`.
+        assert_eq!(
+            ReasoningPolicy::derive("glm-5.1", "https://open.bigmodel.cn/api/paas/v4"),
+            ReasoningPolicy::Exclude
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-v4-flash", ""),
+            ReasoningPolicy::Include
+        );
+
+        let mut asst = Message::assistant("ans", vec![]);
+        asst.reasoning = Some("why".into());
+        let cfg = OpenAiCompatConfig::new("k", "https://x.test", "glm-5.1");
+
+        // GLM (Exclude): no echo regardless of the heard field.
+        let glm = build_request_body(
+            "glm-5.1",
+            &[asst.clone()],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Exclude,
+            ReasoningField::Reasoning,
+        );
+        assert!(glm["messages"][0].get("reasoning_content").is_none());
+        assert!(glm["messages"][0].get("reasoning").is_none());
+
+        // DeepSeek-V4 (Include): echoes reasoning_content even if it once heard `reasoning`.
+        let v4 = build_request_body(
+            "deepseek-v4-flash",
+            &[asst],
+            &[],
+            &ChatOptions::default(),
+            &cfg,
+            ReasoningPolicy::Include,
+            ReasoningField::Reasoning,
+        );
+        assert_eq!(v4["messages"][0]["reasoning_content"], "why");
+        assert!(v4["messages"][0].get("reasoning").is_none());
     }
 
     #[test]
@@ -2682,6 +2993,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -2708,6 +3020,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["function"]["name"], "todowrite");
@@ -2727,6 +3040,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -2749,6 +3063,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -2780,6 +3095,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -2839,6 +3155,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
 
         assert_eq!(
@@ -2896,6 +3213,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["reasoning_effort"], "max");
     }
@@ -2914,6 +3232,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("reasoning_effort").is_none(),
@@ -2936,6 +3255,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["reasoning_effort"], "medium");
     }
@@ -2952,6 +3272,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["thinking"], json!({"type":"enabled","keep":"all"}));
     }
@@ -2966,6 +3287,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("thinking").is_none(),
@@ -2987,6 +3309,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["tool_choice"], "none");
     }
@@ -2996,8 +3319,18 @@ mod tests {
         let h1 = vec![Message::system("s"), Message::user("u1")];
         let mut h2 = h1.clone();
         h2.push(Message::assistant("a1", vec![]));
-        let f1 = format_messages(&h1, ReasoningPolicy::Exclude, true);
-        let f2 = format_messages(&h2, ReasoningPolicy::Exclude, true);
+        let f1 = format_messages(
+            &h1,
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
+        let f2 = format_messages(
+            &h2,
+            ReasoningPolicy::Exclude,
+            true,
+            ReasoningField::ReasoningContent,
+        );
         for i in 0..f1.len() {
             assert_eq!(
                 serde_json::to_string(&f1[i]).unwrap(),
@@ -3035,6 +3368,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         ))
         .unwrap();
         for _ in 0..100 {
@@ -3045,6 +3379,7 @@ mod tests {
                 &opts,
                 &cfg,
                 ReasoningPolicy::Include,
+                ReasoningField::ReasoningContent,
             ))
             .unwrap();
             assert_eq!(

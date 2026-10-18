@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 
+### port-3：reasoning 字段名回传（2026-10-18，用户可见 provider 行为，新增配置取值）
+
+> 上游 atomcode "reasoning 字段名回传"特性移植：部分 OpenAI 兼容上游用 `reasoning`（而非 `reasoning_content`）承载思维链。新增 `ReasoningPolicy::Preserve`（配置 `[provider] reasoning_history = "preserve"`）——按流式响应中"听到"的字段名回传，两种命名都能 round-trip。完整交接件见 `.codebuddy/artifacts/2026-10-15-port-3-reasoning-field/`，验证证据见其 `05-test-report.md`（G5 verdict=proceed）。
+
+#### 1. 行为变化
+
+| 项 | 变更 | 用户/调用方可感知效果 |
+|---|---|---|
+| `crates/rustcode-capabilities/src/provider/reasoning.rs` | 新增 `ReasoningField` 枚举 + `HeardReasoningField`（Arc 共享原子 cell）+ `ReasoningPolicy::Preserve` 变体 + `from_config` 接受 `"preserve"` | 显式 opt-in 新策略；`derive()` 逐字节未动（GLM=Exclude、deepseek-v4=Include、r1=Exclude 不变），未配置用户零行为变化 |
+| `crates/rustcode-capabilities/src/provider/openai_compat.rs` | `Delta` 新增 `reasoning` 字段识别；`SseDecoder::hearing()` 记录听到的字段名；`format_messages`/`build_request_body` 回传块三分支（Exclude 不写 / Include 固定 `reasoning_content` / Preserve 写听到的字段名） | `reasoning`-命名上游的思维链不再被丢弃；Preserve 下多轮回传自动跟随上游字段名。Include/Exclude 字节级不变（占位符/键名/序列化序均同改动前） |
+| `crates/rustcode-config/src/config/provider.rs`、`crates/rustcode-coding/src/config.rs` | schema 文档注释补 `"preserve"` 合法值与语义 | 文档与 `from_config` 一致，无漂移 |
+
+#### 2. 风险
+
+- **heard cell 生命周期**：挂 provider 实例（按 agent/session 构建，session 切换即重置）；Relaxed 单字原子无语义竞态；流中止保留最后 heard 值（语义正确）。
+- **上游流中途改字段名**：last-write-wins（代码注释已声明）；无已知上游如此行为。
+- **同 delta 双字段**：`reasoning_content` 优先、`reasoning` 片段丢弃（代码注释已声明）；混合双字段属畸形上游。
+
+#### 3. 验证 / 回滚
+
+- `cargo test -j1 -p rustcode-capabilities` 889 lib + 13 http_mock 全绿（含 7 新测试：机制级 + `multi_round_preserve_echoes_on_the_heard_field` 端到端两轮 HTTP）；`cargo test -j1 -p rustcode-coding` exit=0；clippy 0 警告；fmt 干净。4GiB 容器未跑全 workspace（既有本地策略）。
+- 纯增量、无 schema/持久化/协议变更；回滚 = 还原 6 文件 diff，不影响任何既有行为。
+
 ### 发布链一致性（2026-10-11，用户可见运行时行为 + 发布数据修复）
 
 > 本特性修复「发布链不一致」：`latest.json` 钉在 v5.1.0 而真实当前版本是 6.2.1；in-app updater 原只认 `latest.json` 单版本、`binaries.get(target)` 缺失即 `UpgradeNoTarget`、不回退旧版本。修复 = updater 平台感知回退（消费 `release/index.json` 选 newest-first 中首个含本平台且比当前新的版本，取其 `manifest.json` 的 sha/size 下载）+ `latest.json` 升到 v6.2.1。完整交接件见 `.codebuddy/artifacts/2026-10-11-release-chain-consistency/`，验证证据见其 `05-test-report.md`（G5 verdict=proceed）。

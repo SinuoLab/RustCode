@@ -52,7 +52,9 @@ pub struct ProviderConfig {
     /// historical assistant tool_call messages. `"include"` = always echo
     /// the stored reasoning back (required by Moonshot Kimi K2 thinking,
     /// DeepSeek V4 thinking mode); `"exclude"` = never echo (required by
-    /// DeepSeek V3 R1, safe default for plain OpenAI). Unset = use the
+    /// DeepSeek V3 R1, safe default for plain OpenAI); `"preserve"` = echo
+    /// on whichever field the upstream STREAMED reasoning on this session
+    /// (`reasoning_content` or the shorter `reasoning`). Unset = use the
     /// built-in auto-detect heuristic based on model name / base_url.
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]

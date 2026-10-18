@@ -109,10 +109,11 @@ pub struct CodingAgentConfig {
     pub chat_options: rustcode_kernel::provider::ChatOptions,
     /// Best-effort per-turn Markdown + per-round JSONL logging.
     pub datalog: rustcode_config::config::DatalogConfig,
-    /// Provider `reasoning_history` override (`"include"` | `"exclude"`), passed
-    /// through verbatim to the provider builder. `None`/empty (default) ⇒ the
-    /// adapter's per-model auto-detect ([`ReasoningPolicy::derive`]). This is the
-    /// config knob, not a code default -- the heuristic only applies when it's unset.
+    /// Provider `reasoning_history` override (`"include"` | `"exclude"` |
+    /// `"preserve"`), passed through verbatim to the provider builder. `None`/empty
+    /// (default) ⇒ the adapter's per-model auto-detect ([`ReasoningPolicy::derive`]).
+    /// This is the config knob, not a code default -- the heuristic only applies
+    /// when it's unset.
     ///
     /// [`ReasoningPolicy::derive`]: rustcode_capabilities::provider::ReasoningPolicy::derive
     pub reasoning_history: Option<String>,
