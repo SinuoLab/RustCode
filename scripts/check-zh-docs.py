@@ -92,7 +92,23 @@ def is_artifacts_exempt(path: str) -> bool:
 AC4_DELETED_DOC = "README.zh-CN.md"  # 裁决 D1 删除的交付文档
 AC4_DELETED_DOC_FULL_RE = re.compile(r"README\.zh-CN\.md(:\d+)?")  # 仅用于 ac4_excise 的 S1 fullmatch
 # 裁决 D2：绑定到具体文件的授权新增。键是路径全名（完整相等，非前缀/非通配）。
-AC4_ALLOWED_ADDED_BY_FILE = {"README.md": ("./scripts/build-webui.sh",)}
+# 每项计数上限 AC4_MAX_PER_ENTRY（同一 span 在文件里只放行一次），所以被登记的文件
+# 必须把行内 code span 用到"每个技术标识只出现一次"——重复出现要么改写中文复述，
+# 要么搬进同目录附属 .sh（AC-4 只扫 md）。2026-10-18 交接文档即按此约定登记。
+AC4_ALLOWED_ADDED_BY_FILE = {
+    "README.md": ("./scripts/build-webui.sh",),
+    # docs/handoff/2026-10-18-release-pointers-and-test-hygiene.md（2026-10-18 交接文档，D2 登记 32 项）
+    "docs/handoff/2026-10-18-release-pointers-and-test-hygiene.md": (
+        '--online', '--sha', '.githooks/pre-push', '/upgrade', '38764522684', '38993016685',
+        '39136327878', '51f9a4553', '6.2.3', '60b71be34', '855cf3efc', '90d5038d9', '97f9d235f',
+        'AGENTS.md', 'Cargo.toml', 'RUSTCODE_HOME', 'RUSTCODE_PREPUSH_POINTERS=off',
+        'RUSTCODE_TEST_INCREMENTAL=1', 'RUSTCODE_TEST_JOBS', 'RUSTCODE_TEST_SYMBOLS=1',
+        '[workspace.package].version', 'c55850c4c',
+        'docs/handoff/2026-10-18-release-pointers-verify.sh', 'git push origin dev',
+        'git rm -r release/v6.2.3', 'latest.json', 'min(nproc,2)', 'release version pointers',
+        'release/index.json', 'release/v5.1.0/', 'scripts/release-check-pointers.sh', 'v6.2.1',
+    ),
+}
 AC4_MAX_PER_ENTRY = 1  # 同一 (file, span) 放行次数上限
 AC4_NOT_D1 = object()  # 哨兵：该 span 与 D1 无关
 # 一致性护栏子串（补遗 §2.1 第 4 步）：D1 放行后 new_text 不得再出现该子串（含非 span 位置）
